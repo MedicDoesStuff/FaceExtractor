@@ -19,63 +19,6 @@ except ImportError:
           "  pip install face-alignment torch torchvision")
     sys.exit(1)
 
-def get_transform_mat(landmarks, output_size, face_type):
-    """
-    Compute affine transformation matrix to align face based on landmarks.
-    Mimics LandmarksProcessor.get_transform_mat behavior.
-    """
-    if landmarks is None or len(landmarks) < 68:
-        return None
-
-    # Define reference points for alignment (based on 68-point landmarks)
-    # Using eyes and nose tip for stable alignment
-    left_eye = np.mean(landmarks[36:42], axis=0)  # Left eye (indices 36-41)
-    right_eye = np.mean(landmarks[42:48], axis=0)  # Right eye (indices 42-47)
-    nose_tip = landmarks[30]  # Nose tip (index 30)
-
-    # Compute face center and scale
-    face_center = (left_eye + right_eye) / 2
-    eye_distance = np.linalg.norm(right_eye - left_eye)
-
-    # Adjust scale based on face type
-    scale_factor = 1.0
-    if face_type == "whole_face":
-        scale_factor = 1.2  # Include more forehead
-    elif face_type == "head":
-        scale_factor = 1.5  # Include full head
-    elif face_type == "mve_custom":
-        scale_factor = 1.3  # Custom adjustment (tune as needed)
-
-    # Desired eye distance in output image (proportional to output_size)
-    desired_eye_dist = output_size * 0.25  # Tune this to match second script's padding
-    scale = desired_eye_dist / (eye_distance * scale_factor)
-
-    # Compute rotation to align eyes horizontally
-    eye_vec = right_eye - left_eye
-    angle = np.arctan2(eye_vec[1], eye_vec[0]) * 180 / np.pi
-
-    # Compute transformation matrix
-    M = cv2.getRotationMatrix2D(tuple(face_center), angle, scale)
-
-    # Adjust translation to center the face in the output image
-    # Desired center of face in output image
-    desired_center = np.array([output_size / 2, output_size / 2])
-
-    # Shift based on face type (e.g., whole_face shifts up slightly)
-    shift_y = 0
-    if face_type == "whole_face":
-        shift_y = -output_size * 0.1  # Shift up to include forehead
-    elif face_type == "head":
-        shift_y = -output_size * 0.15  # Shift up more for head
-    elif face_type == "mve_custom":
-        shift_y = -output_size * 0.12  # Custom shift
-
-    # Update translation component
-    M[0, 2] += desired_center[0] - face_center[0] * scale
-    M[1, 2] += desired_center[1] - face_center[1] * scale + shift_y
-
-    return M
-
 # EMA Smoothing
 def ema_smooth_all_landmarks(landmarks, alpha=0.8, scene_cut_flags=None):
     n = len(landmarks)
@@ -306,31 +249,43 @@ def main():
             continue
 
         h, w, _ = img.shape
-
-        # Compute transformation matrix based on landmarks and face type
-        M = get_transform_mat(lmrk, out_size, chosen_face_type)
-        if M is None:
-            print(f"Failed to compute transform matrix for {fname}, skipping warp.")
-            continue
-
-        # Warp the image
-        warped_face = cv2.warpAffine(img, M, (out_size, out_size), flags=cv2.INTER_LANCZOS4)
-
-        # Transform landmarks to warped space
-        ones = np.ones((68, 1), dtype=np.float32)
-        lmrk_2d = np.hstack([lmrk, ones])
-        warped_2d = (lmrk_2d @ M.T)
-
-        # Compute source rectangle (approximate for metadata)
         minx, maxx = int(np.min(lmrk[:, 0])), int(np.max(lmrk[:, 0]))
         miny, maxy = int(np.min(lmrk[:, 1])), int(np.max(lmrk[:, 1]))
-        side = max(maxx - minx, maxy - miny)
-        cx, cy = (minx + maxx) // 2, (miny + maxy) // 2
+        box_width, box_height = maxx - minx, maxy - miny
+
+        mg_x = int(margin_fraction * box_width)
+        mg_y = int(margin_fraction * box_height)
+        sx, ex = minx - mg_x, maxx + mg_x
+        sy, ey = miny - mg_y, maxy + mg_y
+
+        box_h = ey - sy
+        shift_up = int(shift_fraction * box_h)
+        sy -= shift_up
+        ey -= shift_up
+
+        sx, sy = max(0, sx), max(0, sy)
+        ex, ey = min(w, ex), min(h, ey)
+
+        if ex - sx < 20 or ey - sy < 20:
+            print(f"Box too small in {fname}, skipping warp.")
+            continue
+
+        bw, bh = ex - sx, ey - sy
+        side = max(bw, bh)
+        cx, cy = (sx + ex) // 2, (sy + ey) // 2
         half_side = side // 2
         sq_sx, sq_sy = cx - half_side, cy - half_side
         sq_ex, sq_ey = sq_sx + side, sq_sy + side
 
-        # Save output
+        src_pts = np.float32([[sq_sx, sq_sy], [sq_sx, sq_ey], [sq_ex, sq_sy]])
+        dst_pts = np.float32([[0, 0], [0, out_size - 1], [out_size - 1, 0]])
+        M = cv2.getAffineTransform(src_pts, dst_pts)
+        warped_face = cv2.warpAffine(img, M, (out_size, out_size), flags=cv2.INTER_LANCZOS4)
+
+        ones = np.ones((68, 1), dtype=np.float32)
+        lmrk_2d = np.hstack([lmrk, ones])
+        warped_2d = (lmrk_2d @ M.T)
+
         base_name, _ = os.path.splitext(fname)
         out_name = f"{base_name}_dfl.jpg"
         out_path = os.path.join(output_folder, out_name)
