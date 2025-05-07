@@ -19,7 +19,7 @@ except ImportError:
           "  pip install face-alignment torch torchvision")
     sys.exit(1)
 
-# EMA Smoothing
+# EMA Smoothing (unchanged)
 def ema_smooth_all_landmarks(landmarks, alpha=0.8, scene_cut_flags=None):
     n = len(landmarks)
     smoothed = [None] * n
@@ -41,7 +41,7 @@ def ema_smooth_all_landmarks(landmarks, alpha=0.8, scene_cut_flags=None):
                 prev = new_points
     return smoothed
 
-# Kalman Filter
+# Kalman Filter (unchanged)
 class Kalman2D:
     def __init__(self, q_factor=0.01, r_factor=1.0):
         self.x = np.zeros((4, 1), dtype=np.float32)
@@ -112,7 +112,7 @@ def kalman_smooth_all_landmarks(landmarks, q_factor=0.01, r_factor=1.0, scene_cu
     return smoothed
 
 def main():
-    # Prompt for input/output folders
+    # Input/output folders
     input_folder = input("Enter input folder path: ").strip()
     if not os.path.isdir(input_folder):
         print("Invalid input folder.")
@@ -121,7 +121,7 @@ def main():
     if not os.path.isdir(output_folder):
         os.makedirs(output_folder)
 
-    # Prompt for resolution
+    # Resolution selection
     resolutions = {"256": 256, "320": 320, "384": 384, "512": 512, "640": 640, "768": 768, "1024": 1024}
     print("Available resolutions: 256, 320, 384, 512, 640, 768, 1024")
     out_size = input("Enter resolution (default 512): ").strip() or "512"
@@ -131,13 +131,13 @@ def main():
     else:
         out_size = resolutions[out_size]
 
-    # Prompt for face type
+    # Face type selection
     face_types = {"1": "full_face", "2": "whole_face", "3": "head", "4": "mve_custom"}
     print("Face types: 1) Full Face, 2) Whole Face, 3) Head, 4) Custom")
     face_choice = input("Enter face type (1-4, default 2): ").strip() or "2"
     chosen_face_type = face_types.get(face_choice, "whole_face")
 
-    # Prompt for margin and shift
+    # Margin and shift
     margin_fraction = float(input("Enter margin fraction (default 0.20): ").strip() or 0.20)
     shift_fraction = float(input("Enter upward shift fraction (default 0.15): ").strip() or 0.15)
     if chosen_face_type == "whole_face":
@@ -146,7 +146,7 @@ def main():
         margin_fraction += 0.50
         shift_fraction += 0.10
 
-    # Prompt for smoothing
+    # Smoothing options
     smoothing_enabled = input("Enable smoothing? (y/n, default n): ").strip().lower() == "y"
     smoothing_mode = "none"
     alpha = 0.80
@@ -162,14 +162,20 @@ def main():
             kalman_q = float(input("Enter Kalman Q (default 0.001): ").strip() or 0.001)
             kalman_r = float(input("Enter Kalman R (default 3.0): ").strip() or 3.0)
 
-    # Prompt for scene cut threshold
+    # Scene cut threshold
     scene_cut_thresh = float(input("Enter scene cut threshold (default 50): ").strip() or 50.0)
 
     # Device selection
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    fa = face_alignment.FaceAlignment(face_alignment.LandmarksType.TWO_D, flip_input=False, device=str(device))
+    # Initialize face alignment with improved settings
+    fa = face_alignment.FaceAlignment(
+        face_alignment.LandmarksType.TWO_D,
+        flip_input=False,
+        device=str(device),
+        face_detector='sfd'  # Use SFD for better face detection
+    )
 
     # Load images
     image_files = [f for f in os.listdir(input_folder) if os.path.splitext(f)[1].lower() in (".jpg", ".jpeg", ".png")]
@@ -179,13 +185,13 @@ def main():
         print("No images found.")
         return
 
-    landmarks_list = [None] * total_count
-    bbox_centers = [None] * total_count
+    # Store multiple faces per frame: list of lists, each inner list contains dicts with landmarks and bbox
+    frame_data = [[] for _ in range(total_count)]
     scene_cut_flags = [False] * total_count
 
     start_time = time.time()
 
-    # Pass 1: Detection
+    # Pass 1: Detection of multiple faces
     for i, fname in enumerate(image_files):
         path = os.path.join(input_folder, fname)
         img = cv2.imread(path)
@@ -195,51 +201,56 @@ def main():
 
         try:
             results = fa.get_landmarks_from_image(img)
-        except:
+        except Exception as e:
+            print(f"Error processing {fname}: {e}")
             results = None
 
         if not results:
-            print(f"No face detected in {fname}")
+            print(f"No faces detected in {fname}")
         else:
-            best_area = 0
-            best_lmrk = None
+            # Store all detected faces
             for lmrk in results:
-                minx, maxx = np.min(lmrk[:, 0]), np.max(lmrk[:, 0])
-                miny, maxy = np.min(lmrk[:, 1]), np.max(lmrk[:, 1])
-                area = (maxx - minx) * (maxy - miny)
-                if area > best_area:
-                    best_area = area
-                    best_lmrk = lmrk
-            if best_lmrk is not None:
-                best_lmrk = best_lmrk.astype(np.float32)
-                landmarks_list[i] = best_lmrk
-                minx, maxx = int(np.min(best_lmrk[:, 0])), int(np.max(best_lmrk[:, 0]))
-                miny, maxy = int(np.min(best_lmrk[:, 1])), int(np.max(best_lmrk[:, 1]))
+                lmrk = lmrk.astype(np.float32)
+                minx, maxx = int(np.min(lmrk[:, 0])), int(np.max(lmrk[:, 0]))
+                miny, maxy = int(np.min(lmrk[:, 1])), int(np.max(lmrk[:, 1]))
                 cx, cy = (minx + maxx) / 2.0, (miny + maxy) / 2.0
-                bbox_centers[i] = (cx, cy)
+                area = (maxx - minx) * (maxy - miny)
+                frame_data[i].append({
+                    'landmarks': lmrk,
+                    'bbox_center': (cx, cy),
+                    'area': area
+                })
 
-        # Scene cut detection
-        if i > 0 and bbox_centers[i] and bbox_centers[i - 1]:
-            px, py = bbox_centers[i - 1]
-            cx, cy = bbox_centers[i]
-            dist = np.hypot(cx - px, cy - py)
-            if dist > scene_cut_thresh:
-                scene_cut_flags[i] = True
+        # Scene cut detection (based on largest face)
+        if i > 0 and frame_data[i] and frame_data[i - 1]:
+            prev_face = max(frame_data[i - 1], key=lambda x: x['area']) if frame_data[i - 1] else None
+            curr_face = max(frame_data[i], key=lambda x: x['area']) if frame_data[i] else None
+            if prev_face and curr_face:
+                px, py = prev_face['bbox_center']
+                cx, cy = curr_face['bbox_center']
+                dist = np.hypot(cx - px, cy - py)
+                if dist > scene_cut_thresh:
+                    scene_cut_flags[i] = True
 
         print(f"Pass 1/2: {i + 1}/{total_count} frames processed.")
 
-    # Smoothing
+    # Smoothing (applied per face)
     if smoothing_enabled and smoothing_mode != "none":
-        if smoothing_mode == "ema":
-            landmarks_list = ema_smooth_all_landmarks(landmarks_list, alpha, scene_cut_flags)
-        else:
-            landmarks_list = kalman_smooth_all_landmarks(landmarks_list, kalman_q, kalman_r, scene_cut_flags)
+        for i in range(total_count):
+            for face_data in frame_data[i]:
+                landmarks = face_data['landmarks']
+                # Create a single-frame landmarks list for smoothing
+                landmarks_list = [landmarks]
+                if smoothing_mode == "ema":
+                    smoothed = ema_smooth_all_landmarks(landmarks_list, alpha, [scene_cut_flags[i]])
+                else:
+                    smoothed = kalman_smooth_all_landmarks(landmarks_list, kalman_q, kalman_r, [scene_cut_flags[i]])
+                face_data['landmarks'] = smoothed[0] if smoothed[0] is not None else landmarks
 
-    # Pass 2: Warp & Save
+    # Pass 2: Warp & Save multiple faces
     pass2_count = 0
     for i, fname in enumerate(image_files):
-        lmrk = landmarks_list[i]
-        if lmrk is None:
+        if not frame_data[i]:
             continue
 
         path = os.path.join(input_folder, fname)
@@ -249,67 +260,91 @@ def main():
             continue
 
         h, w, _ = img.shape
-        minx, maxx = int(np.min(lmrk[:, 0])), int(np.max(lmrk[:, 0]))
-        miny, maxy = int(np.min(lmrk[:, 1])), int(np.max(lmrk[:, 1]))
-        box_width, box_height = maxx - minx, maxy - miny
+        for face_idx, face_data in enumerate(frame_data[i]):
+            lmrk = face_data['landmarks']
 
-        mg_x = int(margin_fraction * box_width)
-        mg_y = int(margin_fraction * box_height)
-        sx, ex = minx - mg_x, maxx + mg_x
-        sy, ey = miny - mg_y, maxy + mg_y
+            # Compute face center as centroid of all landmarks
+            face_center = np.mean(lmrk, axis=0)  # [x, y]
+            cx, cy = face_center
 
-        box_h = ey - sy
-        shift_up = int(shift_fraction * box_h)
-        sy -= shift_up
-        ey -= shift_up
+            # Estimate face size as max distance between landmarks
+            distances = []
+            for j in range(len(lmrk)):
+                for k in range(j + 1, len(lmrk)):
+                    dist = np.hypot(lmrk[j, 0] - lmrk[k, 0], lmrk[j, 1] - lmrk[k, 1])
+                    distances.append(dist)
+            max_dist = max(distances) if distances else 100.0  # Fallback size
+            side = max_dist * 1.5 * (1.0 + margin_fraction)  # Scale and add margin
 
-        sx, sy = max(0, sx), max(0, sy)
-        ex, ey = min(w, ex), min(h, ey)
+            # Apply upward shift
+            shift_up = int(shift_fraction * side)
+            cy -= shift_up
 
-        if ex - sx < 20 or ey - sy < 20:
-            print(f"Box too small in {fname}, skipping warp.")
-            continue
+            # Define square region centered at face centroid
+            half_side = side / 2.0
+            sq_sx, sq_sy = cx - half_side, cy - half_side
+            sq_ex, sq_ey = cx + half_side, cy + half_side
 
-        bw, bh = ex - sx, ey - sy
-        side = max(bw, bh)
-        cx, cy = (sx + ex) // 2, (sy + ey) // 2
-        half_side = side // 2
-        sq_sx, sq_sy = cx - half_side, cy - half_side
-        sq_ex, sq_ey = sq_sx + side, sq_sy + side
+            # Ensure region is within image bounds
+            sq_sx, sq_sy = max(0, sq_sx), max(0, sq_sy)
+            sq_ex, sq_ey = min(w, sq_ex), min(h, sq_ey)
 
-        src_pts = np.float32([[sq_sx, sq_sy], [sq_sx, sq_ey], [sq_ex, sq_sy]])
-        dst_pts = np.float32([[0, 0], [0, out_size - 1], [out_size - 1, 0]])
-        M = cv2.getAffineTransform(src_pts, dst_pts)
-        warped_face = cv2.warpAffine(img, M, (out_size, out_size), flags=cv2.INTER_LANCZOS4)
+            if sq_ex - sq_sx < 20 or sq_ey - sq_sy < 20:
+                print(f"Box too small for face {face_idx + 1} in {fname}, skipping warp.")
+                continue
 
-        ones = np.ones((68, 1), dtype=np.float32)
-        lmrk_2d = np.hstack([lmrk, ones])
-        warped_2d = (lmrk_2d @ M.T)
+            # Compute rotation angle using eyes (left eye: 36-41, right eye: 42-47)
+            left_eye = np.mean(lmrk[36:42], axis=0)
+            right_eye = np.mean(lmrk[42:48], axis=0)
+            dx = right_eye[0] - left_eye[0]
+            dy = right_eye[1] - left_eye[1]
+            angle = np.arctan2(dy, dx) * 180 / np.pi  # Angle in degrees
 
-        base_name, _ = os.path.splitext(fname)
-        out_name = f"{base_name}_dfl.jpg"
-        out_path = os.path.join(output_folder, out_name)
-        cv2.imwrite(out_path, warped_face, [cv2.IMWRITE_JPEG_QUALITY, 95])
+            # Create rotation matrix centered at face centroid
+            scale = out_size / side  # Scale to map side to out_size
+            M_rot = cv2.getRotationMatrix2D((cx, cy), angle, scale)
 
-        dflimg = DFLJPG.load(out_path)
-        if dflimg is None:
-            print(f"Failed to embed metadata in {out_name}.")
-            continue
+            # Adjust translation to map face center to center of output image
+            M_rot[0, 2] += (out_size / 2.0 - cx)
+            M_rot[1, 2] += (out_size / 2.0 - cy)
 
-        dflimg.set_face_type(chosen_face_type)
-        dflimg.set_landmarks(warped_2d.tolist())
-        dflimg.set_source_rect([sq_sx, sq_sy, sq_ex, sq_ey])
-        dflimg.set_source_landmarks(lmrk.tolist())
-        dflimg.set_image_to_face_mat(M.flatten().tolist())
-        dflimg.set_source_filename(fname)
-        dflimg.save()
+            # Warp the image
+            warped_face = cv2.warpAffine(img, M_rot, (out_size, out_size), flags=cv2.INTER_LANCZOS4)
 
-        pass2_count += 1
+            # Transform landmarks
+            ones = np.ones((68, 1), dtype=np.float32)
+            lmrk_2d = np.hstack([lmrk, ones])
+            warped_2d = (lmrk_2d @ M_rot.T)[:, :2]  # Keep only x, y coordinates
+
+            # Define source rectangle (approximate, for metadata)
+            src_rect = [int(sq_sx), int(sq_sy), int(sq_ex), int(sq_ey)]
+
+            # Save output
+            base_name, _ = os.path.splitext(fname)
+            out_name = f"{base_name}_face{face_idx + 1}_dfl.jpg"
+            out_path = os.path.join(output_folder, out_name)
+            cv2.imwrite(out_path, warped_face, [cv2.IMWRITE_JPEG_QUALITY, 95])
+
+            dflimg = DFLJPG.load(out_path)
+            if dflimg is None:
+                print(f"Failed to embed metadata in {out_name}.")
+                continue
+
+            dflimg.set_face_type(chosen_face_type)
+            dflimg.set_landmarks(warped_2d.tolist())
+            dflimg.set_source_rect(src_rect)
+            dflimg.set_source_landmarks(lmrk.tolist())
+            dflimg.set_image_to_face_mat(M_rot.flatten().tolist())
+            dflimg.set_source_filename(fname)
+            dflimg.save()
+
+            pass2_count += 1
+
         print(f"Pass 2/2: {i + 1}/{total_count} frames processed.")
 
     total_elapsed = time.time() - start_time
-    total_detected = sum(1 for x in landmarks_list if x is not None)
-    print(f"Done! Detected faces in {total_detected} images, warped {pass2_count} images.")
+    total_detected = sum(len(frame) for frame in frame_data)
+    print(f"Done! Detected {total_detected} faces across {total_count} images, warped {pass2_count} faces.")
     print(f"Total time: {total_elapsed:.1f}s, Saved to: {output_folder}")
 
 if __name__ == "__main__":
