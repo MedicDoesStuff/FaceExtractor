@@ -1,0 +1,13 @@
+alpha: '0.50'
+face_type: whole_face
+input_folder: D:/text_extractor/input
+kalman_q: '0.001'
+kalman_r: '3.0'
+margin: '0.20'
+output_folder: D:/text_extractor/output
+remember_settings: true
+resolution_value: 512
+scene_cut_threshold: '50'
+shift: '0.15'
+smooth_enabled: false
+smooth_mode: ema
