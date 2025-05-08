@@ -4,6 +4,10 @@ import time
 import cv2
 import numpy as np
 import yaml
+import torch
+import torchvision.transforms as transforms
+from PIL import Image
+from pathlib import Path
 
 try:
     from DFLJPG import DFLJPG
@@ -13,10 +17,17 @@ except ImportError:
 
 try:
     import face_alignment
-    import torch
 except ImportError:
-    print("You must install face-alignment and torch:\n"
-          "  pip install face-alignment torch torchvision")
+    print("You must install face-alignment:\n"
+          "  pip install face-alignment")
+    sys.exit(1)
+
+# Import for face parsing (BiSeNet)
+try:
+    from model import BiSeNet  # Assumes face-parsing.PyTorch repository is installed
+except ImportError:
+    print("BiSeNet model not found. Install face-parsing.PyTorch or equivalent:\n"
+          "  pip install face-parsing")
     sys.exit(1)
 
 # EMA Smoothing and Kalman Filter remain unchanged
@@ -70,7 +81,7 @@ class Kalman2D:
         S = self.H @ self.P @ self.H.T + self.R
         K = self.P @ self.H.T @ np.linalg.inv(S)
         self.x = self.x + K @ yk
-        self.P = (np.eye(4, dtype=np.float32) - K @ self.H) @ self.P
+        self.P = (np.eye(4, dtype[np.float32]) - K @ self.H) @ self.P
 
     def step(self, meas):
         if not self.initialized:
@@ -110,6 +121,54 @@ def kalman_smooth_all_landmarks(landmarks, q_factor=0.01, r_factor=1.0, scene_cu
             smoothed[i] = new_points
     return smoothed
 
+# MODIFIED: Function to generate XSeg-compatible face mask and optional binary mask
+def get_face_mask(image, net, device, resolution=512, binary_mask=False):
+    """
+    Generate an XSeg-compatible face mask using BiSeNet, with option for binary mask.
+    Args:
+        image: Input image (numpy array, BGR).
+        net: BiSeNet model instance.
+        device: Torch device (cuda or cpu).
+        resolution: Output resolution (e.g., 512).
+        binary_mask: If True, return a binary mask (0 = black, 255 = white).
+    Returns:
+        mask: Numpy array of shape (resolution, resolution, 1) for XSeg mask (float32, [0, 1]),
+              or (resolution, resolution) for binary mask (uint8, {0, 255}).
+    """
+    # Convert BGR to RGB
+    img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    img_pil = Image.fromarray(img_rgb)
+
+    # Preprocess image
+    transform = transforms.Compose([
+        transforms.Resize((512, 512)),  # BiSeNet expects 512x512 input
+        transforms.ToTensor(),
+        transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+    ])
+    img_tensor = transform(img_pil).unsqueeze(0).to(device)
+
+    # Run segmentation
+    with torch.no_grad():
+        out = net(img_tensor)[0]
+    parsing = out.squeeze(0).cpu().numpy()  # Shape: (19, 512, 512)
+
+    # Get face skin probabilities (label 1 = face skin)
+    face_probs = torch.softmax(torch.from_numpy(parsing), dim=0)[1].numpy()  # Shape: (512, 512)
+
+    # Resize to target resolution
+    face_probs = cv2.resize(face_probs, (resolution, resolution), interpolation=cv2.INTER_LINEAR)
+
+    if binary_mask:
+        # Create binary mask (0 = black, 255 = white)
+        mask = (face_probs >= 0.1).astype(np.uint8) * 255  # Threshold at 0.1, convert to 0 or 255
+        return mask
+    else:
+        # Create XSeg-compatible mask
+        mask = face_probs.astype(np.float32)[:, :, np.newaxis]
+        mask = np.clip(mask, 0, 1)
+        mask[mask < 0.1] = 0  # Mimic XSeg's noise removal
+        return mask
+
 def main():
     # Input/output folders
     input_folder = input("Enter input folder path: ").strip()
@@ -119,6 +178,9 @@ def main():
     output_folder = input("Enter output folder path: ").strip()
     if not os.path.isdir(output_folder):
         os.makedirs(output_folder)
+
+    # NEW: Create XSeg mask folder if binary mask option is enabled
+    xseg_folder = os.path.join(os.path.dirname(output_folder), os.path.basename(output_folder) + "_xseg")
 
     # Resolution selection
     resolutions = {"256": 256, "320": 320, "384": 384, "512": 512, "640": 640, "768": 768, "1024": 1024}
@@ -144,6 +206,17 @@ def main():
     elif chosen_face_type == "head":
         margin_fraction += 0.30
         shift_fraction += 0.05
+
+    # Option for XSeg-compatible face masking
+    mask_face_only = input("Generate XSeg-compatible face mask (exclude hair, ears, neck)? (y/n, default n): ").strip().lower() == "y"
+
+    # NEW: Option for binary XSeg masks (white face, black background)
+    save_binary_masks = input("Generate binary XSeg masks (white face, black background) in a separate folder? (y/n, default n): ").strip().lower() == "y"
+    if save_binary_masks and not mask_face_only:
+        print("Binary mask generation requires XSeg-compatible masking. Enabling mask_face_only.")
+        mask_face_only = True
+    if save_binary_masks:
+        os.makedirs(xseg_folder, exist_ok=True)
 
     # Smoothing options
     smoothing_enabled = input("Enable smoothing? (y/n, default n): ").strip().lower() == "y"
@@ -175,6 +248,21 @@ def main():
         device=str(device),
         face_detector='sfd'
     )
+
+    # Initialize BiSeNet for face parsing if masking is enabled
+    if mask_face_only:
+        n_classes = 19  # BiSeNet default for face parsing
+        net = BiSeNet(n_classes=n_classes)
+        net.to(device)
+        # Load pre-trained weights (update path as needed)
+        model_path = "models/79999_iter.pth"
+        if not os.path.exists(model_path):
+            print(f"Model weights not found at {model_path}. Download from face-parsing.PyTorch repository.")
+            sys.exit(1)
+        net.load_state_dict(torch.load(model_path, map_location=device))
+        net.eval()
+    else:
+        net = None
 
     # Load images
     image_files = [f for f in os.listdir(input_folder) if os.path.splitext(f)[1].lower() in (".jpg", ".jpeg", ".png")]
@@ -311,6 +399,25 @@ def main():
             # Warp the image
             warped_face = cv2.warpAffine(img, M_rot, (out_size, out_size), flags=cv2.INTER_LANCZOS4)
 
+            # Apply XSeg-compatible face mask if enabled
+            if mask_face_only and net is not None:
+                # Generate XSeg-compatible mask
+                xseg_mask = get_face_mask(warped_face, net, device, resolution=out_size, binary_mask=False)
+                
+                # Apply mask to the warped face (optional: for visualization)
+                warped_face_rgba = cv2.cvtColor(warped_face, cv2.COLOR_BGR2BGRA)
+                warped_face_rgba[:, :, 3] = (xseg_mask[:, :, 0] * 255).astype(np.uint8)  # Alpha channel
+                warped_face = cv2.cvtColor(warped_face_rgba, cv2.COLOR_BGRA2BGR)
+                
+                # NEW: Generate and save binary mask if enabled
+                if save_binary_masks:
+                    binary_mask = get_face_mask(warped_face, net, device, resolution=out_size, binary_mask=True)
+                    binary_mask_path = os.path.join(xseg_folder, f"{os.path.splitext(fname)[0]}_face{face_idx + 1}_dfl.png")
+                    cv2.imwrite(binary_mask_path, binary_mask)
+            else:
+                # Keep original warped face (BGR)
+                warped_face = warped_face
+
             # Transform landmarks
             ones = np.ones((68, 1), dtype=np.float32)
             lmrk_2d = np.hstack([lmrk, ones])
@@ -319,7 +426,7 @@ def main():
             # Define source rectangle
             src_rect = [int(sq_sx), int(sq_sy), int(sq_ex), int(sq_ey)]
 
-            # Save output
+            # Save warped face
             base_name, _ = os.path.splitext(fname)
             out_name = f"{base_name}_face{face_idx + 1}_dfl.jpg"
             out_path = os.path.join(output_folder, out_name)
@@ -346,6 +453,8 @@ def main():
     total_detected = sum(len(frame) for frame in frame_data)
     print(f"Done! Detected {total_detected} faces across {total_count} images, warped {pass2_count} faces.")
     print(f"Total time: {total_elapsed:.1f}s, Saved to: {output_folder}")
+    if save_binary_masks:
+        print(f"Binary XSeg masks saved to: {xseg_folder}")
 
 if __name__ == "__main__":
     main()
