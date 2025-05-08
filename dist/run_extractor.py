@@ -19,7 +19,7 @@ except ImportError:
           "  pip install face-alignment torch torchvision")
     sys.exit(1)
 
-# EMA Smoothing (unchanged)
+# EMA Smoothing and Kalman Filter remain unchanged
 def ema_smooth_all_landmarks(landmarks, alpha=0.8, scene_cut_flags=None):
     n = len(landmarks)
     smoothed = [None] * n
@@ -41,7 +41,6 @@ def ema_smooth_all_landmarks(landmarks, alpha=0.8, scene_cut_flags=None):
                 prev = new_points
     return smoothed
 
-# Kalman Filter (unchanged)
 class Kalman2D:
     def __init__(self, q_factor=0.01, r_factor=1.0):
         self.x = np.zeros((4, 1), dtype=np.float32)
@@ -137,14 +136,14 @@ def main():
     face_choice = input("Enter face type (1-4, default 2): ").strip() or "2"
     chosen_face_type = face_types.get(face_choice, "whole_face")
 
-    # Margin and shift
-    margin_fraction = float(input("Enter margin fraction (default 0.20): ").strip() or 0.20)
-    shift_fraction = float(input("Enter upward shift fraction (default 0.15): ").strip() or 0.15)
+    # Margin and shift adjustments
+    margin_fraction = float(input("Enter margin fraction (default 0.15): ").strip() or 0.15)
+    shift_fraction = float(input("Enter upward shift fraction (default 0.10): ").strip() or 0.10)
     if chosen_face_type == "whole_face":
-        margin_fraction += 0.20
+        margin_fraction += 0.10
     elif chosen_face_type == "head":
-        margin_fraction += 0.50
-        shift_fraction += 0.10
+        margin_fraction += 0.30
+        shift_fraction += 0.05
 
     # Smoothing options
     smoothing_enabled = input("Enable smoothing? (y/n, default n): ").strip().lower() == "y"
@@ -169,12 +168,12 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Initialize face alignment with improved settings
+    # Initialize face alignment
     fa = face_alignment.FaceAlignment(
         face_alignment.LandmarksType.TWO_D,
         flip_input=False,
         device=str(device),
-        face_detector='sfd'  # Use SFD for better face detection
+        face_detector='sfd'
     )
 
     # Load images
@@ -185,7 +184,7 @@ def main():
         print("No images found.")
         return
 
-    # Store multiple faces per frame: list of lists, each inner list contains dicts with landmarks and bbox
+    # Store multiple faces per frame
     frame_data = [[] for _ in range(total_count)]
     scene_cut_flags = [False] * total_count
 
@@ -208,7 +207,6 @@ def main():
         if not results:
             print(f"No faces detected in {fname}")
         else:
-            # Store all detected faces
             for lmrk in results:
                 lmrk = lmrk.astype(np.float32)
                 minx, maxx = int(np.min(lmrk[:, 0])), int(np.max(lmrk[:, 0]))
@@ -221,7 +219,7 @@ def main():
                     'area': area
                 })
 
-        # Scene cut detection (based on largest face)
+        # Scene cut detection
         if i > 0 and frame_data[i] and frame_data[i - 1]:
             prev_face = max(frame_data[i - 1], key=lambda x: x['area']) if frame_data[i - 1] else None
             curr_face = max(frame_data[i], key=lambda x: x['area']) if frame_data[i] else None
@@ -234,12 +232,11 @@ def main():
 
         print(f"Pass 1/2: {i + 1}/{total_count} frames processed.")
 
-    # Smoothing (applied per face)
+    # Smoothing
     if smoothing_enabled and smoothing_mode != "none":
         for i in range(total_count):
             for face_data in frame_data[i]:
                 landmarks = face_data['landmarks']
-                # Create a single-frame landmarks list for smoothing
                 landmarks_list = [landmarks]
                 if smoothing_mode == "ema":
                     smoothed = ema_smooth_all_landmarks(landmarks_list, alpha, [scene_cut_flags[i]])
@@ -247,7 +244,7 @@ def main():
                     smoothed = kalman_smooth_all_landmarks(landmarks_list, kalman_q, kalman_r, [scene_cut_flags[i]])
                 face_data['landmarks'] = smoothed[0] if smoothed[0] is not None else landmarks
 
-    # Pass 2: Warp & Save multiple faces
+    # Pass 2: Warp & Save multiple faces with centering on eyes, nose, mouth
     pass2_count = 0
     for i, fname in enumerate(image_files):
         if not frame_data[i]:
@@ -263,18 +260,23 @@ def main():
         for face_idx, face_data in enumerate(frame_data[i]):
             lmrk = face_data['landmarks']
 
-            # Compute face center as centroid of all landmarks
-            face_center = np.mean(lmrk, axis=0)  # [x, y]
+            # Compute face center as the average of eyes, nose, and mouth
+            left_eye = np.mean(lmrk[36:42], axis=0)  # Left eye landmarks (36-41)
+            right_eye = np.mean(lmrk[42:48], axis=0)  # Right eye landmarks (42-47)
+            eyes_center = (left_eye + right_eye) / 2.0
+            nose_center = np.mean(lmrk[27:36], axis=0)  # Nose landmarks (27-35)
+            mouth_center = np.mean(lmrk[48:68], axis=0)  # Mouth landmarks (48-67)
+            face_center = (eyes_center + nose_center + mouth_center) / 3.0  # Average of the three
             cx, cy = face_center
 
-            # Estimate face size as max distance between landmarks
+            # Estimate face size
             distances = []
             for j in range(len(lmrk)):
                 for k in range(j + 1, len(lmrk)):
                     dist = np.hypot(lmrk[j, 0] - lmrk[k, 0], lmrk[j, 1] - lmrk[k, 1])
                     distances.append(dist)
-            max_dist = max(distances) if distances else 100.0  # Fallback size
-            side = max_dist * 1.5 * (1.0 + margin_fraction)  # Scale and add margin
+            max_dist = max(distances) if distances else 100.0
+            side = max_dist * 1.3 * (1.0 + margin_fraction)
 
             # Apply upward shift
             shift_up = int(shift_fraction * side)
@@ -293,18 +295,16 @@ def main():
                 print(f"Box too small for face {face_idx + 1} in {fname}, skipping warp.")
                 continue
 
-            # Compute rotation angle using eyes (left eye: 36-41, right eye: 42-47)
-            left_eye = np.mean(lmrk[36:42], axis=0)
-            right_eye = np.mean(lmrk[42:48], axis=0)
+            # Rotation angle using eyes
             dx = right_eye[0] - left_eye[0]
             dy = right_eye[1] - left_eye[1]
-            angle = np.arctan2(dy, dx) * 180 / np.pi  # Angle in degrees
+            angle = np.arctan2(dy, dx) * 180 / np.pi
 
-            # Create rotation matrix centered at face centroid
-            scale = out_size / side  # Scale to map side to out_size
+            # Create rotation matrix centered at the refined face centroid
+            scale = out_size / side
             M_rot = cv2.getRotationMatrix2D((cx, cy), angle, scale)
 
-            # Adjust translation to map face center to center of output image
+            # Adjust translation to center the face in the output image
             M_rot[0, 2] += (out_size / 2.0 - cx)
             M_rot[1, 2] += (out_size / 2.0 - cy)
 
@@ -314,9 +314,9 @@ def main():
             # Transform landmarks
             ones = np.ones((68, 1), dtype=np.float32)
             lmrk_2d = np.hstack([lmrk, ones])
-            warped_2d = (lmrk_2d @ M_rot.T)[:, :2]  # Keep only x, y coordinates
+            warped_2d = (lmrk_2d @ M_rot.T)[:, :2]
 
-            # Define source rectangle (approximate, for metadata)
+            # Define source rectangle
             src_rect = [int(sq_sx), int(sq_sy), int(sq_ex), int(sq_ey)]
 
             # Save output
