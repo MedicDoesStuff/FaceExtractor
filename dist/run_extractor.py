@@ -5,22 +5,21 @@ import cv2
 import numpy as np
 import yaml
 import pickle
+import requests
 from scipy.spatial import ConvexHull
 from torch.cuda.amp import autocast
 from numba import jit
+from ultralytics import YOLO
+from core.lib import facedesc as fd
+from core.lib import onnxruntime as lib_ort
+from core.lib.image import FImage
+from core.lib.math import FAffMat3, FVec2fArray, FVec3Array_like, FVec3fArray
+import torch
 
 try:
     from DFLJPG import DFLJPG
 except ImportError:
     print("DFLJPG module not found. Ensure it's in your environment.")
-    sys.exit(1)
-
-try:
-    import face_alignment
-    import torch
-except ImportError:
-    print("You must install face-alignment and torch:\n"
-          "  pip install face-alignment torch torchvision")
     sys.exit(1)
 
 # EMA Smoothing (Vectorized)
@@ -147,6 +146,33 @@ def load_checkpoint(output_folder, checkpoint_path="checkpoint.pkl"):
         return data['frame_data'], data['scene_cut_flags'], data['config']
     return None, None, None
 
+def download_and_combine_onnx_parts(output_path="TDDFAV3.onnx"):
+    urls = [
+        "https://github.com/iperov/DeepixLab/raw/refs/heads/master/DeepixLab/modelhub/onnx/TDDFAV3/TDDFAV3.onnx.part0",
+        "https://github.com/iperov/DeepixLab/raw/refs/heads/master/DeepixLab/modelhub/onnx/TDDFAV3/TDDFAV3.onnx.part1"
+    ]
+    temp_files = ["part0.onnx", "part1.onnx"]
+
+    # Download parts
+    for url, temp_file in zip(urls, temp_files):
+        print(f"Downloading {url}...")
+        response = requests.get(url, stream=True)
+        if response.status_code == 200:
+            with open(temp_file, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+        else:
+            raise Exception(f"Failed to download {url}")
+
+    # Combine parts
+    with open(output_path, 'wb') as f_out:
+        for temp_file in temp_files:
+            with open(temp_file, 'rb') as f_in:
+                f_out.write(f_in.read())
+            os.remove(temp_file)  # Clean up
+
+    print(f"Combined ONNX model saved to {output_path}")
+
 def main():
     # Prompt for input folder first
     input_folder = input("Enter input folder path: ").strip()
@@ -169,7 +195,7 @@ def main():
         print("Loading configuration from checkpoint.")
         config = saved_config
     else:
-        # Interactive prompting (adjusted to include input_folder)
+        # Interactive prompting
         resolutions = {"256": 256, "320": 320, "384": 384, "512": 512, "640": 640, "768": 768, "1024": 1024}
         print("Available resolutions: 256, 320, 384, 512, 640, 768, 1024")
         out_size = input("Enter resolution (default 512): ").strip() or "512"
@@ -192,7 +218,7 @@ def main():
             margin_fraction += 0.30
             shift_fraction += 0.05
         
-        smoothing_enabled = input("Enable smoothing? (y/n, default n): ").strip().lower() == "y"
+        smoothing_enabled = input("Enable smoothing? (y/n, default n): ").strip().lower() == 'y'
         smoothing_mode = "none"
         alpha = 0.80
         kalman_q = 0.001
@@ -245,15 +271,38 @@ def main():
             'downscale_factor': downscale_factor
         }
 
-    # Device and face alignment
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Device setup
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
-    fa = face_alignment.FaceAlignment(
-        face_alignment.LandmarksType.TWO_D,
-        flip_input=False,
-        device=str(device),
-        face_detector='sfd'
-    )
+
+    # Initialize YOLOv8-face
+    try:
+        yolo_model = YOLO("yolov8n-face.pt")
+        yolo_model.to(device)
+    except Exception as e:
+        print(f"Failed to initialize YOLOv8-face: {e}")
+        sys.exit(1)
+
+    # Download and combine TDDFAV3 ONNX parts
+    onnx_path = os.path.join(os.getcwd(), "TDDFAV3.onnx")
+    if not os.path.exists(onnx_path):
+        try:
+            download_and_combine_onnx_parts(onnx_path)
+        except Exception as e:
+            print(f"Failed to download or combine ONNX parts: {e}")
+            sys.exit(1)
+
+    # Initialize TDDFAV3
+    ort_device = lib_ort.get_cpu_device()
+    if device == "cuda":
+        gpu_devices = lib_ort.get_avail_gpu_devices()
+        if gpu_devices:
+            ort_device = gpu_devices[0]
+    try:
+        tddfa_model = TDDFAV3(ort_device)
+    except Exception as e:
+        print(f"Failed to initialize TDDFAV3: {e}")
+        sys.exit(1)
 
     # Load images
     input_folder = config['input_folder']
@@ -270,7 +319,7 @@ def main():
         frame_data = [[] for _ in range(total_count)]
         scene_cut_flags = [False] * total_count
 
-        # Pass 1: Face detection with mixed precision
+        # Pass 1: Face detection with YOLOv8-face and landmarks with TDDFAV3
         prev_img = None
         for batch_start in range(0, total_count, config['batch_size']):
             batch_end = min(batch_start + config['batch_size'], total_count)
@@ -302,21 +351,36 @@ def main():
                         scene_cut_flags[global_idx] = True
                 prev_img = img
 
-                # Face detection with mixed precision
+                # Face detection with YOLOv8-face
                 try:
-                    with autocast():
-                        results = fa.get_landmarks_from_image(img)
-                except Exception as e:
-                    print(f"Error processing {fname}: {e}")
-                    results = None
+                    results = yolo_model(img, conf=0.5, itcrop_y2 = min(img.shape[0], y2)
+                    if x2 - x1 < 20 or y2 - y1 < 20:
+                        print(f"Box too small in {fname}, skipping.")
+                        continue
 
-                if not results:
-                    print(f"No faces detected in {fname}")
-                else:
-                    for lmrk in results:
-                        lmrk = lmrk.astype(np.float32)
+                    padding = int(max(x2 - x1, y2 - y1) * 0.2)
+                    crop_x1 = max(0, x1 - padding)
+                    crop_y1 = max(0, y1 - padding)
+                    crop_x2 = min(img.shape[1], x2 + padding)
+                    crop_y2 = min(img.shape[0], y2 + padding)
+                    face_crop = img[crop_y1:crop_y2, crop_x1:crop_x2]
+
+                    if face_crop.size == 0:
+                        print(f"Invalid crop in {fname}, skipping.")
+                        continue
+
+                    face_crop_rgb = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
+                    fimage = FImage(face_crop_rgb.astype(np.float32) / 255.0)
+
+                    try:
+                        result = tddfa_model.extract(fimage)
+                        lmrk = result.anno_lmrks_2d68.lmrks.as_np()
+                        lmrk[:, 0] += crop_x1
+                        lmrk[:, 1] += crop_y1
                         if config['downscale_factor'] != 1.0:
                             lmrk *= config['downscale_factor']
+                        lmrk = lmrk.astype(np.float32)
+
                         minx, maxx = int(np.min(lmrk[:, 0])), int(np.max(lmrk[:, 0]))
                         miny, maxy = int(np.min(lmrk[:, 1])), int(np.max(lmrk[:, 1]))
                         cx, cy = (minx + maxx) / 2.0, (miny + maxy) / 2.0
@@ -326,10 +390,12 @@ def main():
                             'bbox_center': (cx, cy),
                             'area': area
                         })
+                    except Exception as e:
+                        print(f"Error extracting landmarks in {fname}: {e}")
 
             print(f"Pass 1/2: {batch_end}/{total_count} frames processed.")
 
-        # Save checkpoint after detection
+        # Save checkpoint
         save_checkpoint(frame_data, scene_cut_flags, config, output_folder)
 
     # Smoothing
