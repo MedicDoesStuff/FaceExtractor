@@ -10,10 +10,10 @@ from scipy.spatial import ConvexHull
 from torch.cuda.amp import autocast
 from numba import jit
 from ultralytics import YOLO
-from core.lib import facedesc as fd
-from core.lib import onnxruntime as lib_ort
-from core.lib.image import FImage
-from core.lib.math import FAffMat3, FVec2fArray, FVec3Array_like, FVec3fArray
+import onnxruntime as ort
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Tuple
 import torch
 
 try:
@@ -21,6 +21,246 @@ try:
 except ImportError:
     print("DFLJPG module not found. Ensure it's in your environment.")
     sys.exit(1)
+
+class TDDFAV3:
+    @dataclass(frozen=True)
+    class ExtractResult:
+        anno_lmrks_ysa_range: np.ndarray  # Shape: (4, 2), YSA range points
+        anno_lmrks_2d68: np.ndarray      # Shape: (68, 2), 68 2D landmarks
+        anno_pose: Tuple[float, float, float]  # Pitch, yaw, roll in radians
+
+    @staticmethod
+    def get_available_devices() -> List[str]:
+        providers = ['CPUExecutionProvider']
+        if 'CUDAExecutionProvider' in ort.get_available_providers():
+            providers.append('CUDAExecutionProvider')
+        return providers
+
+    def __init__(self, device: str):
+        if device not in self.get_available_devices():
+            raise Exception(f"Device {device} not in available devices: {self.get_available_devices()}")
+
+        # Load ONNX model
+        model_path = Path(__file__).parent / 'TDDFAV3.onnx'
+        if not model_path.exists():
+            raise FileNotFoundError(f"TDDFAV3.onnx not found at {model_path}")
+        
+        self._sess = ort.InferenceSession(str(model_path), providers=[device])
+        self._input_name = self._sess.get_inputs()[0].name
+
+        # Camera and projection settings
+        self._camera_distance = 10.0
+        self._world2view_proj = np.array([
+            [1015.0, 0, 0],
+            [0, 1015.0, 0],
+            [112.0, 112.0, 1]
+        ], dtype=np.float32)
+
+        # Base 68 points
+        self._base_68_pts = np.array([
+            [-7.31536686e-01,  2.18324587e-01, -5.90363741e-01],
+            [-7.12017059e-01,  2.05892213e-02, -5.66208839e-01],
+            [-6.73399091e-01, -1.59576654e-01, -5.48621714e-01],
+            [-6.34890258e-01, -3.22125107e-01, -5.10903060e-01],
+            [-5.79798579e-01, -4.96289551e-01, -4.19760287e-01],
+            [-4.81546730e-01, -6.35660410e-01, -2.58796811e-01],
+            [-3.65231335e-01, -7.19112933e-01, -6.17607236e-02],
+            [-2.16505706e-01, -7.86682427e-01,  1.23575926e-01],
+            [ 2.67814938e-03, -8.24886858e-01,  1.96671784e-01],
+            [ 2.22356066e-01, -7.84747124e-01,  1.23866975e-01],
+            [ 3.70815665e-01, -7.19669700e-01, -6.14449978e-02],
+            [ 4.86512244e-01, -6.38140500e-01, -2.58221686e-01],
+            [ 5.84084928e-01, -5.00324249e-01, -4.18844312e-01],
+            [ 6.39234543e-01, -3.27089548e-01, -5.09994268e-01],
+            [ 6.75870717e-01, -1.63255274e-01, -5.48786998e-01],
+            [ 7.11227357e-01,  1.79298557e-02, -5.67488015e-01],
+            [ 7.29938626e-01,  2.17761174e-01, -5.88844717e-01],
+            [-5.71316302e-01,  4.34932321e-01,  3.62963080e-02],
+            [-4.88676876e-01,  4.98392701e-01,  1.56470120e-01],
+            [-3.82955074e-01,  5.19677103e-01,  2.39974141e-01],
+            [-2.81491995e-01,  5.10921121e-01,  2.91035414e-01],
+            [-1.89839065e-01,  4.85920191e-01,  3.15223455e-01],
+            [ 1.87804177e-01,  4.88169491e-01,  3.14644337e-01],
+            [ 2.79995173e-01,  5.13860941e-01,  2.89511085e-01],
+            [ 3.81981879e-01,  5.23234010e-01,  2.37666845e-01],
+            [ 4.89439726e-01,  5.01603365e-01,  1.55025303e-01],
+            [ 5.72133660e-01,  4.36524928e-01,  3.49660516e-02],
+            [ 1.76257803e-03,  2.96220154e-01,  3.45770597e-01],
+            [ 2.21833796e-03,  1.75731063e-01,  4.35879111e-01],
+            [ 3.29834060e-03,  5.63835837e-02,  5.29183626e-01],
+            [ 3.25349881e-03, -4.61793244e-02,  5.52442431e-01],
+            [-1.18324623e-01, -1.37969166e-01,  3.28948617e-01],
+            [-6.76081181e-02, -1.47517920e-01,  3.74784112e-01],
+            [ 1.47828390e-03, -1.60410553e-01,  3.95576954e-01],
+            [ 6.99714422e-02, -1.47369280e-01,  3.74610901e-01],
+            [ 1.20117076e-01, -1.37369201e-01,  3.28538775e-01],
+            [-4.30975229e-01,  2.91965753e-01,  1.04033232e-01],
+            [-3.67296219e-01,  3.31681073e-01,  1.86997056e-01],
+            [-2.76482165e-01,  3.32692534e-01,  1.89165771e-01],
+            [-1.91997916e-01,  2.88755804e-01,  1.63525820e-01],
+            [-2.68532574e-01,  2.67138541e-01,  1.85307682e-01],
+            [-3.63204300e-01,  2.62323439e-01,  1.62104011e-01],
+            [ 1.87850699e-01,  2.88736135e-01,  1.60180151e-01],
+            [ 2.72823513e-01,  3.33718687e-01,  1.85039103e-01],
+            [ 3.65930617e-01,  3.31698567e-01,  1.84490025e-01],
+            [ 4.31747049e-01,  2.90704608e-01,  1.03410363e-01],
+            [ 3.62510055e-01,  2.63633072e-01,  1.61344767e-01],
+            [ 2.66362846e-01,  2.67252117e-01,  1.83337152e-01],
+            [-2.52169281e-01, -3.81339163e-01,  2.24057317e-01],
+            [-1.62668362e-01, -3.21485281e-01,  3.36322904e-01],
+            [-5.57506531e-02, -2.82682508e-01,  3.96588445e-01],
+            [ 1.30601926e-03, -2.94665217e-01,  4.02246952e-01],
+            [ 5.80654554e-02, -2.82752544e-01,  3.96721244e-01],
+            [ 1.65142193e-01, -3.21170121e-01,  3.35649371e-01],
+            [ 2.48466194e-01, -3.81282359e-01,  2.22357690e-01],
+            [ 1.59650698e-01, -4.18565661e-01,  3.16695571e-01],
+            [ 8.32042322e-02, -4.45940644e-01,  3.59758258e-01],
+            [ 1.67942536e-03, -4.50652659e-01,  3.69605184e-01],
+            [-7.98306689e-02, -4.45663661e-01,  3.60788703e-01],
+            [-1.55356705e-01, -4.18663234e-01,  3.17556500e-01],
+            [-2.27011800e-01, -3.75459403e-01,  2.31117964e-01],
+            [-7.30654746e-02, -3.50188583e-01,  3.43461752e-01],
+            [ 3.90908914e-04, -3.49111587e-01,  3.61925006e-01],
+            [ 7.40414932e-02, -3.50820452e-01,  3.43598366e-01],
+            [ 2.32114658e-01, -3.76261741e-01,  2.27939427e-01],
+            [ 7.26732165e-02, -3.66326064e-01,  3.43837738e-01],
+            [ 8.06166092e-04, -3.69369358e-01,  3.52605700e-01],
+            [-7.08143190e-02, -3.65602463e-01,  3.43259454e-01]
+        ], dtype=np.float32)
+
+        # Eyes and nose indices
+        self._68_nm_idxs = [17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 39, 42, 45]
+
+    @property
+    def input_size(self) -> int:
+        return 224
+
+    def extract(self, img: np.ndarray) -> 'TDDFAV3.ExtractResult':
+        """
+        Arguments:
+            img: np.ndarray, shape (H, W, 3), RGB, float32 in [0, 1]
+        Returns:
+            ExtractResult with 68 2D landmarks, YSA range, and pose
+        """
+        H, W, _ = img.shape
+        input_size = self.input_size
+        h_scale = H / input_size
+        w_scale = W / input_size
+
+        # Preprocess image
+        feed_img = cv2.resize(img, (input_size, input_size))
+        feed_img = np.transpose(feed_img, (2, 0, 1))[None, ...]  # Shape: (1, 3, 224, 224)
+
+        # Run inference
+        w_68_pts, = self._sess.run(None, {self._input_name: feed_img})
+        w_68_pts = w_68_pts[0]  # Shape: (68, 3)
+
+        # Project to view points
+        v_68_pts = self._project_w_pts(w_68_pts) * np.array([w_scale, h_scale])
+
+        # Estimate affine transform
+        mat = self._estimate_affine(self._base_68_pts[self._68_nm_idxs], w_68_pts[self._68_nm_idxs])
+
+        # Transform center and up points
+        points = np.array([
+            [0, -0.13, -0.1],  # p0c
+            [0, 0.53, -0.1],   # p0u
+            [0, -0.13, -0.1 + 1.0],  # p1c
+            [0, 0.53, -0.1 + 1.0]    # p1u
+        ])
+        p0c, p0u, p1c, p1u = self._apply_affine(mat, points)
+
+        # Compute distances
+        p0cp0u_dist = np.linalg.norm(p0u - p0c)
+        p1cp1u_dist = np.linalg.norm(p1u - p1c)
+
+        # Project points to view
+        vp0c, vp0cu, vp0u, vp1c, vp1cu, vp1u = self._project_w_pts([
+            p0c, p0c + [0, -p0cp0u_dist, 0], p0u,
+            p1c, p1c + [0, -p1cp1u_dist, 0], p1u
+        ]) * np.array([w_scale, h_scale])
+
+        # Compute YSA range
+        vp0d = np.linalg.norm(vp0cu - vp0c)
+        vp1d = np.linalg.norm(vp1cu - vp1c)
+        vp0n = (vp0u - vp0c) / np.linalg.norm(vp0u - vp0c)
+        vp1n = (vp1u - vp1c) / np.linalg.norm(vp1u - vp1c)
+        ysa_range = np.array([
+            vp0c + vp0n * vp0d,
+            vp0c - vp0n * vp0d,
+            vp1c + vp1n * vp1d,
+            vp1c - vp1n * vp1d
+        ])
+
+        # Compute pose
+        cp_w, zp_w = self._apply_affine(mat, np.array([[0, 0, 0], [0, 0, 1]]))
+        cpzp_w = zp_w - cp_w
+        d = np.linalg.norm(cpzp_w)
+        pitch_rad = np.arcsin(cpzp_w[1] / d)
+        yaw_rad = np.arcsin(-cpzp_w[0] / d)
+        anno_pose = (pitch_rad, yaw_rad, 0.0)
+
+        return self.ExtractResult(
+            anno_lmrks_ysa_range=ysa_range,
+            anno_lmrks_2d68=v_68_pts,
+            anno_pose=anno_pose
+        )
+
+    def _project_w_pts(self, w_pts: np.ndarray) -> np.ndarray:
+        """
+        Project world points to view points.
+        Args:
+            w_pts: np.ndarray, shape (N, 3)
+        Returns:
+            np.ndarray, shape (N, 2)
+        """
+        cam_pts = w_pts * np.array([1, 1, -1])
+        cam_pts += np.array([0, 0, self._camera_distance])
+        view_pts = cam_pts @ self._world2view_proj
+        view_pts = view_pts[..., :2] / view_pts[..., 2:]
+        view_pts *= np.array([1, -1])
+        view_pts += np.array([0, self.input_size])
+        return view_pts
+
+    def _estimate_affine(self, src_pts: np.ndarray, dst_pts: np.ndarray) -> np.ndarray:
+        """
+        Estimate 3D affine transform from src_pts to dst_pts.
+        Args:
+            src_pts: np.ndarray, shape (N, 3)
+            dst_pts: np.ndarray, shape (N, 3)
+        Returns:
+            np.ndarray, shape (4, 4), homogeneous transform matrix
+        """
+        n = len(src_pts)
+        A = np.zeros((3 * n, 12))
+        b = np.zeros(3 * n)
+        for i in range(n):
+            x, y, z = src_pts[i]
+            A[3 * i, 0:3] = [x, y, z]
+            A[3 * i, 3] = 1
+            A[3 * i + 1, 4:7] = [x, y, z]
+            A[3 * i + 1, 7] = 1
+            A[3 * i + 2, 8:11] = [x, y, z]
+            A[3 * i + 2, 11] = 1
+            b[3 * i:3 * i + 3] = dst_pts[i]
+        
+        x, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
+        mat = np.eye(4)
+        mat[:3, :4] = x.reshape(3, 4)
+        return mat
+
+    def _apply_affine(self, mat: np.ndarray, pts: np.ndarray) -> np.ndarray:
+        """
+        Apply affine transform to points.
+        Args:
+            mat: np.ndarray, shape (4, 4)
+            pts: np.ndarray, shape (N, 3)
+        Returns:
+            np.ndarray, shape (N, 3)
+        """
+        pts_hom = np.hstack([pts, np.ones((len(pts), 1))])
+        transformed = pts_hom @ mat.T
+        return transformed[:, :3]
 
 # EMA Smoothing (Vectorized)
 def ema_smooth_all_landmarks(landmarks, alpha=0.8, scene_cut_flags=None):
@@ -173,6 +413,31 @@ def download_and_combine_onnx_parts(output_path="TDDFAV3.onnx"):
 
     print(f"Combined ONNX model saved to {output_path}")
 
+def download_yolo_pt_model(output_path="models/yolov8n-face.pt"):
+    """Download yolov8n-face.pt model if it doesn't exist."""
+    if os.path.exists(output_path):
+        print(f"YOLO PT model already exists at {output_path}")
+        return True
+
+    url = "https://github.com/akanametov/yolo-face/releases/download/v0.0.0/yolov8n-face.pt"
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    print(f"Downloading YOLO PT model from {url}...")
+    
+    try:
+        response = requests.get(url, stream=True)
+        if response.status_code == 200:
+            with open(output_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            print(f"YOLO PT model saved to {output_path}")
+            return True
+        else:
+            print(f"Failed to download YOLO PT model: HTTP {response.status_code}")
+            return False
+    except Exception as e:
+        print(f"Error downloading YOLO PT model: {e}")
+        return False
+
 def main():
     # Prompt for input folder first
     input_folder = input("Enter input folder path: ").strip()
@@ -240,7 +505,7 @@ def main():
             print("Invalid batch size, using 1.")
             batch_size = 1
         
-        downscale_enabled = input("Downscale frames for face detection? (y/n, default n): ").strip().lower() == "y"
+        downscale_enabled = input("Downscale frames for face detection? (y/n, default n): ").strip().lower() == 'y'
         downscale_factor = 1.0
         if downscale_enabled:
             try:
@@ -275,12 +540,19 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
-    # Initialize YOLOv8-face
+    # Download YOLOv8-face PT model
+    yolo_pt_path = os.path.join(os.getcwd(), "models", "yolov8n-face.pt")
+    if not download_yolo_pt_model(yolo_pt_path):
+        print("Failed to download YOLO PT model. Exiting.")
+        sys.exit(1)
+
+    # Initialize YOLOv8-face with PT model
     try:
-        yolo_model = YOLO("yolov8n-face.pt")
-        yolo_model.to(device)
+        yolo_model = YOLO(yolo_pt_path)  # Load PyTorch model
+        yolo_model.to(device)  # Move to specified device
     except Exception as e:
-        print(f"Failed to initialize YOLOv8-face: {e}")
+        print(f"Failed to initialize YOLOv8-face with PT model: {e}")
+        print("Ensure the ultralytics library is up-to-date and the PT model is compatible.")
         sys.exit(1)
 
     # Download and combine TDDFAV3 ONNX parts
@@ -289,15 +561,11 @@ def main():
         try:
             download_and_combine_onnx_parts(onnx_path)
         except Exception as e:
-            print(f"Failed to download or combine ONNX parts: {e}")
+            print(f"Failed to download or combine TDDFAV3 ONNX parts: {e}")
             sys.exit(1)
 
     # Initialize TDDFAV3
-    ort_device = lib_ort.get_cpu_device()
-    if device == "cuda":
-        gpu_devices = lib_ort.get_avail_gpu_devices()
-        if gpu_devices:
-            ort_device = gpu_devices[0]
+    ort_device = 'CUDAExecutionProvider' if device == "cuda" and 'CUDAExecutionProvider' in TDDFAV3.get_available_devices() else 'CPUExecutionProvider'
     try:
         tddfa_model = TDDFAV3(ort_device)
     except Exception as e:
@@ -353,7 +621,25 @@ def main():
 
                 # Face detection with YOLOv8-face
                 try:
-                    results = yolo_model(img, conf=0.5, itcrop_y2 = min(img.shape[0], y2)
+                    results = yolo_model.predict(img, conf=0.5, iou=0.7)
+                    boxes = []
+                    for r in results:
+                        for box in r.boxes:
+                            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(np.int32)
+                            boxes.append([x1, y1, x2, y2])
+                except Exception as e:
+                    print(f"Error detecting faces in {fname}: {e}")
+                    boxes = []
+
+                if not boxes:
+                    print(f"No faces detected in {fname}")
+                    continue
+
+                # Landmark extraction with TDDFAV3
+                for box in boxes:
+                    x1, y1, x2, y2 = box
+                    x1, y1 = max(0, x1), max(0, y1)
+                    x2, y2 = min(img.shape[1], x2), min(img.shape[0], y2)
                     if x2 - x1 < 20 or y2 - y1 < 20:
                         print(f"Box too small in {fname}, skipping.")
                         continue
@@ -369,12 +655,12 @@ def main():
                         print(f"Invalid crop in {fname}, skipping.")
                         continue
 
-                    face_crop_rgb = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
-                    fimage = FImage(face_crop_rgb.astype(np.float32) / 255.0)
+                    # Convert to RGB, float32, [0, 1] for TDDFAV3
+                    face_crop_rgb = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
 
                     try:
-                        result = tddfa_model.extract(fimage)
-                        lmrk = result.anno_lmrks_2d68.lmrks.as_np()
+                        result = tddfa_model.extract(face_crop_rgb)
+                        lmrk = result.anno_lmrks_2d68  # Shape: (68, 2)
                         lmrk[:, 0] += crop_x1
                         lmrk[:, 1] += crop_y1
                         if config['downscale_factor'] != 1.0:
