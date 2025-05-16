@@ -26,3 +26,4 @@ torch==2.4.1
 tqdm==4.67.1
 typing_extensions==4.12.2
 ultralytics==8.2.103
+ziglang==0.14.0
