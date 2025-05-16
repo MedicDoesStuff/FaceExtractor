@@ -11,6 +11,7 @@ networkx==3.4.2
 numba==0.61.0
 numexpr==2.10.2
 numpy==1.26.4
+onnx==1.18.0
 onnxruntime==1.16.3
 opencv-python==4.11.0.86
 packaging==24.2
