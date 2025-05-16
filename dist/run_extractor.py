@@ -5,8 +5,11 @@ import cv2
 import numpy as np
 import yaml
 import pickle
+import requests
 from scipy.spatial import ConvexHull
+from torch.cuda.amp import autocast
 from numba import jit
+from ultralytics import YOLO
 import onnxruntime as ort
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,132 +21,6 @@ try:
 except ImportError:
     print("DFLJPG module not found. Ensure it's in your environment.")
     sys.exit(1)
-
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Sequence
-import numpy as np
-from core.lib import facedesc as fd
-from core.lib import math as lib_math
-from core.lib import onnxruntime as lib_ort
-from core.lib.functools import cached_method
-from core.lib.image import FImage
-from core.lib.math import FRectf
-
-class YoloV7Face:
-    @dataclass
-    class DetectJob:
-        aug_imgs : Sequence['YoloV7Face._AugmentedImage']
-        minimum_confidence : float
-        nms_threshold : float
-        min_face_size : float
-
-    @dataclass
-    class _AugmentedImage:
-        img : np.ndarray
-        scale : float
-
-    @staticmethod
-    def get_available_devices() -> Sequence[lib_ort.DeviceRef]:
-        return [lib_ort.get_cpu_device()] + lib_ort.get_avail_gpu_devices()
-
-    def __init__(self, device : lib_ort.DeviceRef ):
-        if device not in YoloV7Face.get_available_devices():
-            raise Exception(f'device {device} is not in available devices for YoloV7Face')
-        model_path = Path('/content/FaceExtractor/dist/modelhub/onnx/YoloV7Face/YoloV7Face.onnx')
-        if not model_path.exists():
-            raise FileNotFoundError(f"YoloV7Face.onnx not found at {model_path}")
-        self._sess = lib_ort.InferenceSession_with_device(model_path, device)
-        self._input_name = self._sess.get_inputs()[0].name
-
-    def detect(self, img : FImage, resolution : int = None, pad_to_resolution=False, augment_pyramid=False,
-               minimum_confidence : float = 0.3, nms_threshold=0.3, min_face_size=8) -> Sequence[fd.FFace]:
-        return self.detect_job(self.prepare_job(img, resolution, pad_to_resolution, augment_pyramid,
-                                               minimum_confidence, nms_threshold, min_face_size))
-
-    def prepare_job(self, img : FImage, resolution : int = None, pad_to_resolution=False, augment_pyramid=False,
-                   minimum_confidence : float = 0.3, nms_threshold=0.3, min_face_size=8) -> DetectJob:
-        return self.DetectJob(
-            aug_imgs=self._augment(img.bgr().u8(), grid_size=[32,32], resolution=resolution,
-                                  pad_to_resolution=pad_to_resolution, augment_pyramid=augment_pyramid),
-            minimum_confidence=minimum_confidence, nms_threshold=nms_threshold, min_face_size=min_face_size
-        )
-
-    def detect_job(self, job : DetectJob) -> Sequence[fd.FFace]:
-        preds = []
-        for aug_img in job.aug_imgs:
-            pred = self._get_preds(aug_img.img.CHW()[None,...])[0]
-            pred[:,0:4] *= 1/aug_img.scale
-            preds.append(pred)
-        preds = np.concatenate(preds, 0)
-        preds = preds[ preds[...,4] >= job.minimum_confidence ]
-        preds = preds[ preds[...,2:4].min(-1) >= job.min_face_size ]
-        x,y,w,h,confidence = preds.T
-        w_half = w/2
-        h_half = h/2
-        l, t, r, b = x-w_half, y-h_half, x+w_half, y+h_half
-        keep = lib_math.nms(l,t,r,b, confidence, job.nms_threshold)
-        l, t, r, b, confidence = l[keep], t[keep], r[keep], b[keep], confidence[keep]
-        return [ fd.FFace(FRectf(l,t,r,b)).set_confidence(confidence).set_detector_id('YoloV7Face')
-                 for l,t,r,b,confidence in np.stack([l, t, r, b, confidence], -1) ]
-
-    def _get_preds(self, img : np.ndarray):
-        N,C,H,W = img.shape
-        preds = self._sess.run(None, {self._input_name: img})
-        pred0, pred1, pred2 = [pred.reshape((N,C,21,pred.shape[-2], pred.shape[-1])).transpose(0,1,3,4,2)[...,0:5] for pred in preds]
-        pred0 = self._process_pred(pred0, W, H, anchor=[[4,5],[6,8],[10,12]]).reshape((N, -1, 5))
-        pred1 = self._process_pred(pred1, W, H, anchor=[[15,19],[23,30],[39,52]]).reshape((N, -1, 5))
-        pred2 = self._process_pred(pred2, W, H, anchor=[[72,97],[123,164],[209,297]]).reshape((N, -1, 5))
-        return np.concatenate([pred0, pred1, pred2], 1)[...,:5]
-
-    def _process_pred(self, pred, img_w, img_h, anchor):
-        pred_h = pred.shape[-3]
-        pred_w = pred.shape[-2]
-        anchor = np.float32(anchor)[None,:,None,None,:]
-        grid = self._get_grid(pred_w, pred_h)
-        stride = (img_w // pred_w, img_h // pred_h)
-        pred = YoloV7Face._sigmoid(pred)
-        pred[..., 0:2] = (pred[..., 0:2]*2 - 0.5 + grid) * stride
-        pred[..., 2:4] = (pred[..., 2:4]*2)**2 * anchor
-        return pred
-
-    @cached_method
-    def _get_grid(self, W, H) -> np.ndarray:
-        _xv, _yv = np.meshgrid(np.arange(W, dtype=np.float32), np.arange(H, dtype=np.float32))
-        return np.stack((_xv, _yv), 2).reshape((1, 1, H, W, 2))
-
-    @staticmethod
-    def _sigmoid(x : np.ndarray) -> np.ndarray:
-        positives = x >= 0
-        negatives = ~positives
-        exp_x_neg = np.exp(x[negatives])
-        y = x.copy()
-        y[positives] = 1 / (1 + np.exp(-x[positives]))
-        y[negatives] = exp_x_neg / (1 + exp_x_neg)
-        return y
-
-    def _augment(self, img: np.ndarray, grid_size: List[int], resolution: int = None,
-                 pad_to_resolution: bool = False, augment_pyramid: bool = False) -> Sequence[_AugmentedImage]:
-        aug_imgs = []
-        h, w, _ = img.shape
-        scale = 1.0
-        if resolution:
-            scale = resolution / max(h, w)
-            if pad_to_resolution:
-                new_h, new_w = int(h * scale), int(w * scale)
-                img = cv2.resize(img, (new_w, new_h))
-                if new_h < resolution or new_w < resolution:
-                    pad_h = (resolution - new_h) // 2
-                    pad_w = (resolution - new_w) // 2
-                    img = cv2.copyMakeBorder(img, pad_h, resolution - new_h - pad_h,
-                                           pad_w, resolution - new_w - pad_w, cv2.BORDER_CONSTANT)
-        aug_imgs.append(self._AugmentedImage(img=img.astype(np.float32) / 255.0, scale=scale))
-        if augment_pyramid:
-            for pyramid_scale in [0.5, 2.0]:
-                scaled_img = cv2.resize(img, None, fx=pyramid_scale, fy=pyramid_scale)
-                aug_imgs.append(self._AugmentedImage(img=scaled_img.astype(np.float32) / 255.0,
-                                                  scale=scale * pyramid_scale))
-        return aug_imgs
 
 class TDDFAV3:
     @dataclass(frozen=True)
@@ -162,7 +39,7 @@ class TDDFAV3:
     def __init__(self, device: str):
         if device not in self.get_available_devices():
             raise Exception(f"Device {device} not in available devices: {self.get_available_devices()}")
-        model_path = Path('/content/FaceExtractor/dist/TDDFAV3.onnx')
+        model_path = Path(__file__).parent / 'TDDFAV3.onnx'
         if not model_path.exists():
             raise FileNotFoundError(f"TDDFAV3.onnx not found at {model_path}")
         self._sess = ort.InferenceSession(str(model_path), providers=[device])
@@ -191,7 +68,7 @@ class TDDFAV3:
             [ 6.75870717e-01, -1.63255274e-01, -5.48786998e-01],
             [ 7.11227357e-01,  1.79298557e-02, -5.67488015e-01],
             [ 7.29938626e-01,  2.17761174e-01, -5.88844717e-01],
-            [-5.71316302e-01,  4 | 34932321e-01,  3.62963080e-02],
+            [-5.71316302e-01,  4.34932321e-01,  3.62963080e-02],
             [-4.88676876e-01,  4.98392701e-01,  1.56470120e-01],
             [-3.82955074e-01,  5.19677103e-01,  2.39974141e-01],
             [-2.81491995e-01,  5.10921121e-01,  2.91035414e-01],
@@ -258,8 +135,16 @@ class TDDFAV3:
         feed_img = np.transpose(feed_img, (2, 0, 1))[None, ...]
         w_68_pts, = self._sess.run(None, {self._input_name: feed_img})
         w_68_pts = w_68_pts[0]
-        v_68_pts = self._project_w_pts(w_68_pts) * np.array([w_scale, h_scale])
         mat = self._estimate_affine(self._base_68_pts[self._68_nm_idxs], w_68_pts[self._68_nm_idxs])
+        cp_w, zp_w = self._apply_affine(mat, np.array([[0, 0, 0], [0, 0, 1]]))
+        cpzp_w = zp_w - cp_w
+        d = np.linalg.norm(cpzp_w)
+        yaw_rad = np.arcsin(-cpzp_w[0] / d)
+        pitch_rad = np.arcsin(cpzp_w[1] / d)
+        stable_indices = list(range(0, 17)) + list(range(27, 36))
+        mat = self._estimate_affine(self._base_68_pts[stable_indices], w_68_pts[stable_indices])
+        v_68_pts = self._project_w_pts(w_68_pts) * np.array([w_scale, h_scale])
+        v_68_pts = self._refine_landmarks(v_68_pts, stable_indices)
         points = np.array([
             [0, -0.13, -0.1],
             [0, 0.53, -0.1],
@@ -283,12 +168,8 @@ class TDDFAV3:
             vp1c + vp1n * vp1d,
             vp1c - vp1n * vp1d
         ])
-        cp_w, zp_w = self._apply_affine(mat, np.array([[0, 0, 0], [0, 0, 1]]))
-        cpzp_w = zp_w - cp_w
-        d = np.linalg.norm(cpzp_w)
-        pitch_rad = np.arcsin(cpzp_w[1] / d)
-        yaw_rad = np.arcsin(-cpzp_w[0] / d)
-        anno_pose = (pitch_rad, yaw_rad, 0.0)
+        roll_rad = 0.0
+        anno_pose = (pitch_rad, yaw_rad, roll_rad)
         return self.ExtractResult(
             anno_lmrks_ysa_range=ysa_range,
             anno_lmrks_2d68=v_68_pts,
@@ -327,7 +208,16 @@ class TDDFAV3:
         transformed = pts_hom @ mat.T
         return transformed[:, :3]
 
-def ema_smooth_all_landmarks(landmarks, alpha=0.8, scene_cut_flags=None):
+    def _refine_landmarks(self, landmarks: np.ndarray, stable_indices: List[int]) -> np.ndarray:
+        refined = landmarks.copy()
+        for i in range(68):
+            if i not in stable_indices:
+                distances = np.linalg.norm(landmarks[stable_indices] - landmarks[i], axis=1)
+                nearest_idx = stable_indices[np.argmin(distances)]
+                refined[i] = 0.75 * refined[i] + 0.25 * landmarks[nearest_idx]
+        return refined
+
+def ema_smooth_all_landmarks(landmarks, alpha=0.85, scene_cut_flags=None):
     n = len(landmarks)
     landmarks_array = np.array(landmarks, dtype=np.float32)
     smoothed = np.zeros_like(landmarks_array)
@@ -336,6 +226,7 @@ def ema_smooth_all_landmarks(landmarks, alpha=0.8, scene_cut_flags=None):
     for i in range(n):
         if not valid_mask[i]:
             smoothed[i] = np.nan
+            prev = None
             continue
         curr = landmarks_array[i]
         if prev is None or (scene_cut_flags is not None and scene_cut_flags[i]):
@@ -345,81 +236,6 @@ def ema_smooth_all_landmarks(landmarks, alpha=0.8, scene_cut_flags=None):
             smoothed[i] = alpha * prev + (1 - alpha) * curr
             prev = smoothed[i]
     return [smoothed[i] if valid_mask[i] else None for i in range(n)]
-
-@jit(nopython=True)
-def kalman_step(x, P, F, Q, H, R, meas, initialized):
-    if not initialized:
-        if meas is not None:
-            x[0, 0] = meas[0]
-            x[1, 0] = meas[1]
-            initialized = True
-            return meas, x, P, initialized
-    x = F @ x
-    P = F @ P @ F.T + Q
-    if meas is not None:
-        z = np.array([[meas[0]], [meas[1]]])
-        yk = z - (H @ x)
-        S = H @ P @ H.T + R
-        K = P @ H.T @ np.linalg.inv(S)
-        x = x + K @ yk
-        P = (np.eye(4) - K @ H) @ P
-    return (x[0, 0], x[1, 0]), x, P, initialized
-
-class Kalman2D:
-    def __init__(self, q_factor=0.01, r_factor=1.0):
-        self.x = np.zeros((4, 1), dtype=np.float32)
-        self.P = np.eye(4, dtype=np.float32) * 10.0
-        self.Q = np.eye(4, dtype=np.float32) * q_factor
-        self.R = np.eye(2, dtype=np.float32) * r_factor
-        self.F = np.eye(4, dtype=np.float32)
-        self.F[0, 2] = 1.0
-        self.F[1, 3] = 1.0
-        self.H = np.zeros((2, 4), dtype=np.float32)
-        self.H[0, 0] = 1.0
-        self.H[1, 1] = 1.0
-        self.initialized = False
-
-    def init_state(self, x, y):
-        self.x[0, 0] = x
-        self.x[1, 0] = y
-        self.initialized = True
-
-    def step(self, meas):
-        if not self.initialized:
-            if meas is not None:
-                self.init_state(*meas)
-                return meas
-            return None
-        out, self.x, self.P, self.initialized = kalman_step(
-            self.x, self.P, self.F, self.Q, self.H, self.R,
-            meas if meas is not None else None, self.initialized
-        )
-        return out
-
-def kalman_smooth_all_landmarks(landmarks, q_factor=0.01, r_factor=1.0, scene_cut_flags=None):
-    n_frames = len(landmarks)
-    if n_frames == 0:
-        return []
-    kfs = [Kalman2D(q_factor, r_factor) for _ in range(68)]
-    smoothed = [None] * n_frames
-    for i in range(n_frames):
-        if landmarks[i] is None:
-            smoothed[i] = None
-            for k in range(68):
-                kfs[k].step(None)
-            continue
-        if scene_cut_flags is not None and scene_cut_flags[i]:
-            smoothed[i] = landmarks[i]
-            for k in range(68):
-                kfs[k].init_state(landmarks[i][k][0], landmarks[i][k][1])
-        else:
-            new_points = np.zeros((68, 2), dtype=np.float32)
-            for k in range(68):
-                meas = landmarks[i][k]
-                out = kfs[k].step(meas)
-                new_points[k] = out if out is not None else meas
-            smoothed[i] = new_points
-    return smoothed
 
 def compute_histogram_diff(img1, img2):
     if img1 is None or img2 is None:
@@ -443,6 +259,104 @@ def load_checkpoint(output_folder, checkpoint_path="checkpoint.pkl"):
             data = pickle.load(f)
         return data['frame_data'], data['scene_cut_flags'], data['config']
     return None, None, None
+
+def download_and_combine_onnx_parts(output_path="TDDFAV3.onnx"):
+    urls = [
+        "https://github.com/iperov/DeepixLab/raw/refs/heads/master/DeepixLab/modelhub/onnx/TDDFAV3/TDDFAV3.onnx.part0",
+        "https://github.com/iperov/DeepixLab/raw/refs/heads/master/DeepixLab/modelhub/onnx/TDDFAV3/TDDFAV3.onnx.part1"
+    ]
+    temp_files = ["part0.onnx", "part1.onnx"]
+    for url, temp_file in zip(urls, temp_files):
+        print(f"Downloading {url}...")
+        response = requests.get(url, stream=True)
+        if response.status_code == 200:
+            with open(temp_file, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+        else:
+            raise Exception(f"Failed to download {url}")
+    with open(output_path, 'wb') as f_out:
+        for temp_file in temp_files:
+            with open(temp_file, 'rb') as f_in:
+                f_out.write(f_in.read())
+            os.remove(temp_file)
+    print(f"Combined ONNX model saved to {output_path}")
+
+def download_yolo_pt_model(output_path="models/yolov11n-face.pt"):
+    if os.path.exists(output_path):
+        print(f"YOLO PT model already exists at {output_path}")
+        return True
+    url = "https://github.com/akanametov/yolo-face/releases/download/v0.0.0/yolov11n-face.pt"
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    print(f"Downloading YOLO PT model from {url}...")
+    try:
+        response = requests.get(url, stream=True)
+        if response.status_code == 200:
+            with open(output_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            print(f"YOLO PT model saved to {output_path}")
+            return True
+        else:
+            print(f"Failed to download YOLO PT model: HTTP {response.status_code}")
+            return False
+    except Exception as e:
+        print(f"Error downloading YOLO PT model: {e}")
+        return False
+
+def get_adaptive_rotation_angle(landmarks, yaw_deg):
+    def compute_angle(p1, p2):
+        """Compute angle in degrees between two points, handling edge cases."""
+        dy = p2[1] - p1[1]
+        dx = p2[0] - p1[0]
+        angle = np.arctan2(dy, dx) * 180.0 / np.pi
+        return angle if np.isfinite(angle) else None
+
+    def get_frontal_rotation(landmarks):
+        """Compute rotation for frontal faces using eye and mouth landmarks."""
+        pairs = [
+            (landmarks[36], landmarks[45]),  # Outer eye corners
+            (landmarks[39], landmarks[42]),  # Inner eye corners
+            (landmarks[48], landmarks[54]),  # Mouth corners
+        ]
+        angles = []
+        for p1, p2 in pairs:
+            angle = compute_angle(p1, p2)
+            if angle is not None and abs(angle) < 45:
+                angles.append(angle)
+        if not angles:
+            return 0.0
+        return np.mean(angles)
+
+    def get_side_rotation(landmarks):
+        """Compute rotation for side profiles using nose, jaw, and mouth."""
+        pairs = [
+            (landmarks[30], landmarks[8]),   # Nose to chin
+            (landmarks[30], landmarks[51]),  # Nose to mouth center
+            (landmarks[3], landmarks[8]),    # Jaw point to chin
+            (landmarks[13], landmarks[8]),   # Other jaw point to chin
+        ]
+        angles = []
+        for p1, p2 in pairs:
+            angle = compute_angle(p1, p2)
+            if angle is not None and abs(angle - 90) < 45:
+                angles.append(angle - 90.0)
+        if not angles:
+            return 0.0
+        return np.mean(angles) * 0.3
+
+    if yaw_deg < 30:
+        return get_frontal_rotation(landmarks)
+    elif yaw_deg > 75:
+        side_angle = get_side_rotation(landmarks)
+        if abs(side_angle) > 15:
+            return side_angle
+        return 0.0
+    else:
+        t = (yaw_deg - 30) / 45
+        frontal_angle = get_frontal_rotation(landmarks)
+        side_angle = get_side_rotation(landmarks)
+        return (1 - t) * frontal_angle + t * side_angle
 
 def main():
     input_folder = input("Enter input folder path: ").strip()
@@ -473,27 +387,17 @@ def main():
         print("Face types: 1) Full Face, 2) Whole Face, 3) Head, 4) Custom")
         face_choice = input("Enter face type (1-4, default 2): ").strip() or "2"
         chosen_face_type = face_types.get(face_choice, "whole_face")
-        margin_fraction = float(input("Enter margin fraction (default 0.15): ").strip() or 0.15)
+        margin_fraction = float(input("Enter margin fraction (default 0.2): ").strip() or 0.2)
         shift_fraction = float(input("Enter upward shift fraction (default 0.10): ").strip() or 0.10)
         if chosen_face_type == "whole_face":
-            margin_fraction += 0.10
+            margin_fraction += 0.15
         elif chosen_face_type == "head":
-            margin_fraction += 0.30
+            margin_fraction += 0.35
             shift_fraction += 0.05
-        smoothing_enabled = input("Enable smoothing? (y/n, default n): ").strip().lower() == 'y'
-        smoothing_mode = "none"
-        alpha = 0.80
-        kalman_q = 0.001
-        kalman_r = 3.0
+        smoothing_enabled = input("Enable smoothing? (y/n, default y): ").strip().lower() != 'n'
+        alpha = 0.85
         if smoothing_enabled:
-            print("Smoothing modes: 1) EMA, 2) Kalman")
-            mode_choice = input("Enter smoothing mode (1-2, default 1): ").strip() or "1"
-            smoothing_mode = "ema" if mode_choice == "1" else "kalman"
-            if smoothing_mode == "ema":
-                alpha = float(input("Enter EMA alpha (0-1, default 0.80): ").strip() or 0.80)
-            else:
-                kalman_q = float(input("Enter Kalman Q (default 0.001): ").strip() or 0.001)
-                kalman_r = float(input("Enter Kalman R (default 3.0): ").strip() or 3.0)
+            alpha = float(input("Enter EMA alpha (0-1, default 0.85): ").strip() or 0.85)
         scene_cut_thresh = float(input("Enter scene cut threshold (0-1, default 0.7): ").strip() or 0.7)
         batch_size = int(input("Enter batch size for frame processing (default 1): ").strip() or 1)
         if batch_size < 1:
@@ -510,6 +414,7 @@ def main():
             except ValueError:
                 print("Invalid downscale factor. Using no downscaling.")
                 downscale_factor = 1.0
+        debug_visualization = input("Enable debug visualization? (y/n, default y): ").strip().lower() != 'n'
         config = {
             'input_folder': input_folder,
             'output_folder': output_folder,
@@ -519,23 +424,34 @@ def main():
             'shift_fraction': shift_fraction,
             'smoothing': {
                 'enabled': smoothing_enabled,
-                'mode': smoothing_mode,
-                'alpha': alpha,
-                'kalman_q': kalman_q,
-                'kalman_r': kalman_r
+                'mode': 'ema',
+                'alpha': alpha
             },
             'scene_cut_thresh': scene_cut_thresh,
             'batch_size': batch_size,
-            'downscale_factor': downscale_factor
+            'downscale_factor': downscale_factor,
+            'debug_visualization': debug_visualization
         }
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
-    ort_device = 'CUDAExecutionProvider' if device == "cuda" and 'CUDAExecutionProvider' in TDDFAV3.get_available_devices() else 'CPUExecutionProvider'
-    try:
-        yolo_model = YoloV7Face(lib_ort.DeviceRef(ort_device))
-    except Exception as e:
-        print(f"Failed to initialize YoloV7Face: {e}")
+    yolo_pt_path = os.path.join(os.getcwd(), "models", "yolov11n-face.pt")
+    if not download_yolo_pt_model(yolo_pt_path):
+        print("Failed to download YOLO PT model. Exiting.")
         sys.exit(1)
+    try:
+        yolo_model = YOLO(yolo_pt_path)
+        yolo_model.to(device)
+    except Exception as e:
+        print(f"Failed to initialize YOLOv11-face with PT model: {e}")
+        sys.exit(1)
+    onnx_path = os.path.join(os.getcwd(), "TDDFAV3.onnx")
+    if not os.path.exists(onnx_path):
+        try:
+            download_and_combine_onnx_parts(onnx_path)
+        except Exception as e:
+            print(f"Failed to download or combine TDDFAV3 ONNX parts: {e}")
+            sys.exit(1)
+    ort_device = 'CUDAExecutionProvider' if device == "cuda" and 'CUDAExecutionProvider' in TDDFAV3.get_available_devices() else 'CPUExecutionProvider'
     try:
         tddfa_model = TDDFAV3(ort_device)
     except Exception as e:
@@ -579,10 +495,12 @@ def main():
                         scene_cut_flags[global_idx] = True
                 prev_img = img
                 try:
-                    fimage = FImage(img)
-                    faces = yolo_model.detect(fimage, minimum_confidence=0.5, nms_threshold=0.7, min_face_size=20)
-                    boxes = [[int(face.rect.left), int(face.rect.top), int(face.rect.right), int(face.rect.bottom)]
-                             for face in faces]
+                    results = yolo_model.predict(img, conf=0.35, iou=0.7)
+                    boxes = []
+                    for r in results:
+                        for box in r.boxes:
+                            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(np.int32)
+                            boxes.append([x1, y1, x2, y2])
                 except Exception as e:
                     print(f"Error detecting faces in {fname}: {e}")
                     boxes = []
@@ -593,10 +511,16 @@ def main():
                     x1, y1, x2, y2 = box
                     x1, y1 = max(0, x1), max(0, y1)
                     x2, y2 = min(img.shape[1], x2), min(img.shape[0], y2)
-                    if x2 - x1 < 20 or y2 - y1 < 20:
-                        print(f"Box too small in {fname}, skipping.")
-                        continue
-                    padding = int(max(x2 - x1, y2 - y1) * 0.2)
+                    if x2 - x1 < 30 or y2 - y1 < 30:
+                        print(f"Box too small in {fname}, expanding box.")
+                        width = x2 - x1
+                        height = y2 - y1
+                        padding = max(width, height) * 0.8
+                        x1 = max(0, x1 - padding)
+                        y1 = max(0, y1 - padding)
+                        x2 = min(img.shape[1], x2 + padding)
+                        y2 = min(img.shape[0], y2 + padding)
+                    padding = int(max(x2 - x1, y2 - y1) * 0.4)
                     crop_x1 = max(0, x1 - padding)
                     crop_y1 = max(0, y1 - padding)
                     crop_x2 = min(img.shape[1], x2 + padding)
@@ -621,26 +545,21 @@ def main():
                         frame_data[global_idx].append({
                             'landmarks': lmrk,
                             'bbox_center': (cx, cy),
-                            'area': area
+                            'area': area,
+                            'pose': result.anno_pose
                         })
                     except Exception as e:
                         print(f"Error extracting landmarks in {fname}: {e}")
             print(f"Pass 1/2: {batch_end}/{total_count} frames processed.")
         save_checkpoint(frame_data, scene_cut_flags, config, output_folder)
-    if config['smoothing']['enabled'] and config['smoothing']['mode'] != "none":
+    if config['smoothing']['enabled']:
         for i in range(total_count):
             for face_data in frame_data[i]:
                 landmarks = face_data['landmarks']
                 landmarks_list = [landmarks]
-                if config['smoothing']['mode'] == "ema":
-                    smoothed = ema_smooth_all_landmarks(
-                        landmarks_list, config['smoothing']['alpha'], [scene_cut_flags[i]]
-                    )
-                else:
-                    smoothed = kalman_smooth_all_landmarks(
-                        landmarks_list, config['smoothing']['kalman_q'], config['smoothing']['kalman_r'],
-                        [scene_cut_flags[i]]
-                    )
+                smoothed = ema_smooth_all_landmarks(
+                    landmarks_list, config['smoothing']['alpha'], [scene_cut_flags[i]]
+                )
                 face_data['landmarks'] = smoothed[0] if smoothed[0] is not None else landmarks
     pass2_count = 0
     for batch_start in range(0, total_count, config['batch_size']):
@@ -658,44 +577,53 @@ def main():
             h, w, _ = img.shape
             for face_idx, face_data in enumerate(frame_data[global_idx]):
                 lmrk = face_data['landmarks']
-                left_eye = np.mean(lmrk[36:42], axis=0)
-                right_eye = np.mean(lmrk[42:48], axis=0)
-                nose_center = np.mean(lmrk[27:36], axis=0)
-                mouth_center = np.mean(lmrk[48:68], axis=0)
-                face_center = (0.4 * (left_eye + right_eye) / 2.0 + 0.3 * nose_center + 0.3 * mouth_center)
+                yaw = face_data['pose'][1]
+                face_center = np.mean(lmrk, axis=0)
                 cx, cy = face_center
-                try:
-                    hull = ConvexHull(lmrk)
-                    hull_points = lmrk[hull.vertices]
-                    distances = [
-                        np.hypot(hull_points[i][0] - hull_points[j][0], hull_points[i][1] - hull_points[j][1])
-                        for i in range(len(hull_points)) for j in range(i + 1, len(hull_points))
-                    ]
-                    max_dist = max(distances) if distances else 100.0
-                except:
-                    max_dist = 100.0
-                side = max_dist * 1.3 * (1.0 + config['margin_fraction'])
-                shift_up = int(config['shift_fraction'] * side)
+                minx, maxx = np.min(lmrk[:, 0]), np.max(lmrk[:, 0])
+                miny, maxy = np.min(lmrk[:, 1]), np.max(lmrk[:, 1])
+                width = maxx - minx
+                height = maxy - miny
+                yaw_deg = abs(yaw * 180.0 / np.pi)
+                if yaw_deg < 30:
+                    margin_factor = config['margin_fraction'] + 0.15
+                elif yaw_deg > 60:
+                    margin_factor = config['margin_fraction'] + 0.25
+                else:
+                    t = (yaw_deg - 30) / 30
+                    margin_factor = config['margin_fraction'] + 0.15 + t * (0.25 - 0.15)
+                margin_factor = min(margin_factor, 0.45)
+                side = max(width, height) * (1.0 + margin_factor)
+                if yaw_deg < 30:
+                    scale_adjust = 1.1
+                elif yaw_deg > 60:
+                    scale_adjust = 1.2
+                else:
+                    t = (yaw_deg - 30) / 30
+                    scale_adjust = 1.1 + t * (1.2 - 1.1)
+                side *= scale_adjust
+                yaw_shift = (yaw / abs(yaw)) * (width * 0.2) if yaw != 0 else 0
+                cx += yaw_shift
+                shift_up = int(min(config['shift_fraction'] * side, height * 0.3))
                 cy -= shift_up
-                half_side = side / 2.0
-                sq_sx, sq_sy = cx - half_side, cy - half_side
-                sq_ex, sq_ey = cx + half_side, cy + half_side
-                sq_sx, sq_sy = max(0, sq_sx), max(0, sq_sy)
-                sq_ex, sq_ey = min(w, sq_ex), min(h, sq_ey)
-                if sq_ex - sq_sx < 20 or sq_ey - sq_sy < 20:
-                    print(f"Box too small for face {face_idx + 1} in {fname}, skipping warp.")
-                    continue
-                dx = right_eye[0] - left_eye[0]
-                dy = right_eye[1] - left_eye[1]
-                angle = np.arctan2(dy, dx) * 180 / np.pi
+                angle = get_adaptive_rotation_angle(lmrk, yaw_deg)
                 scale = config['out_size'] / side
-                M_rot = cv2.getRotationMatrix2D((cx, cy), angle, scale)
-                M_rot[0, 2] += (config['out_size'] / 2.0 - cx)
-                M_rot[1, 2] += (config['out_size'] / 2.0 - cy)
-                warped_face = cv2.warpAffine(img, M_rot, (config['out_size'], config['out_size']), flags=cv2.INTER_LANCZOS4)
+                M = cv2.getRotationMatrix2D((cx, cy), angle, scale)
+                M[0, 2] += config['out_size'] / 2.0 - cx
+                M[1, 2] += config['out_size'] / 2.0 - cy
+                warped_face = cv2.warpAffine(img, M, (config['out_size'], config['out_size']), flags=cv2.INTER_LANCZOS4)
                 ones = np.ones((68, 1), dtype=np.float32)
                 lmrk_2d = np.hstack([lmrk, ones])
-                warped_2d = (lmrk_2d @ M_rot.T)[:, :2]
+                warped_2d = (lmrk_2d @ M.T)[:, :2]
+                if config.get('debug_visualization', False):
+                    vis_img = img.copy()
+                    for pt in lmrk:
+                        cv2.circle(vis_img, (int(pt[0]), int(pt[1])), 2, (0, 255, 0), -1)
+                    sq_sx, sq_sy = cx - side / 2.0, cy - side / 2.0
+                    sq_ex, sq_ey = cx + side / 2.0, cy + side / 2.0
+                    cv2.rectangle(vis_img, (int(sq_sx), int(sq_sy)), (int(sq_ex), int(sq_ey)), (255, 0, 0), 2)
+                    base_name, _ = os.path.splitext(fname)
+                    cv2.imwrite(os.path.join(output_folder, f"debug_{base_name}_face{face_idx + 1}.jpg"), vis_img)
                 base_name, _ = os.path.splitext(fname)
                 out_name = f"{base_name}_face{face_idx + 1}_dfl.jpg"
                 out_path = os.path.join(output_folder, out_name)
@@ -706,9 +634,9 @@ def main():
                     continue
                 dflimg.set_face_type(config['face_type'])
                 dflimg.set_landmarks(warped_2d.tolist())
-                dflimg.set_source_rect([int(sq_sx), int(sq_sy), int(sq_ex), int(sq_ey)])
+                dflimg.set_source_rect([int(cx - side / 2.0), int(cy - side / 2.0), int(cx + side / 2.0), int(cy + side / 2.0)])
                 dflimg.set_source_landmarks(lmrk.tolist())
-                dflimg.set_image_to_face_mat(M_rot.flatten().tolist())
+                dflimg.set_image_to_face_mat(M.flatten().tolist())
                 dflimg.set_source_filename(fname)
                 dflimg.save()
                 pass2_count += 1
